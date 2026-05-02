@@ -39,7 +39,6 @@ def index():
 
 @app.route("/login")
 def login():
-    # Railway environment fix
     redirect_uri = url_for('callback', _external=True, _scheme='https')
     return google.authorize_redirect(redirect_uri)
 
@@ -55,7 +54,6 @@ def logout():
     session.clear()
     return redirect("/")
 
-# ================= NEW: SETTINGS ROUTES =================
 @app.route("/delete_history", methods=["POST"])
 def delete_history():
     user = session.get("user")
@@ -67,14 +65,13 @@ def delete_history():
     db.commit()
     return jsonify({"success": True})
 
-# ================= AI ENGINE (VISION SUPPORT) =================
+# ================= AI ENGINE =================
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 
 def get_ai_response(msg, base64_image=None):
     try:
         headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"}
         content_list = [{"type": "text", "text": msg}]
-        
         if base64_image:
             if "base64," in base64_image:
                 base64_data = base64_image.split("base64,")[1]
@@ -83,24 +80,17 @@ def get_ai_response(msg, base64_image=None):
                 base64_data = base64_image
                 mime_type = "image/jpeg"
             content_list.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_data}"}})
-
         payload = {
             "model": "google/gemini-2.0-flash-001",
             "messages": [
-                {
-                    "role": "system", 
-                    "content": "Your name is Perplex AI. Created by Nihit kr. When someone asks who made you, always answer Nihit kr. You can see images and write code perfectly."
-                },
+                {"role": "system", "content": "Your name is Perplex AI. Created by Nihit kr. You provide expert answers and can see images."},
                 {"role": "user", "content": content_list}
             ]
         }
-        
         r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=60)
         return r.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"Error: {str(e)}"
+    except Exception as e: return f"Error: {str(e)}"
 
-# ================= ROUTES =================
 @app.route("/chat")
 def chat():
     if "user" not in session: return redirect("/")
@@ -126,32 +116,21 @@ def send_msg():
     cid = request.form.get("chat")
     msg = request.form.get("msg")
     img_data = request.form.get("image")
-
     res = db.execute("SELECT msg_count, img_count FROM usage_limits WHERE user=? AND date=?", (user, today)).fetchone()
     m_count, i_count = (res[0], res[1]) if res else (0, 0)
-
-    # UPDATED: 50 msg limit, 5 image limit
-    if m_count >= 50: return jsonify({"error": "Daily limit reached (50/50)"})
-    # If there's an image, check the count
-    if img_data and i_count >= 5: return jsonify({"error": "Image limit exceeded (5/5)."})
-
+    if m_count >= 50: return jsonify({"error": "Daily chat limit reached (50/50)"})
+    if img_data and i_count >= 5: return jsonify({"error": "Image limit exceeded (5/5)"})
     if not cid or cid == "null" or cid == "":
         cid = str(int(time.time()*1000))
         db.execute("INSERT INTO chats VALUES(?,?,?)", (cid, user, msg[:30]))
-
     db.execute("INSERT INTO messages VALUES(?,?,?)", (cid, "user", msg))
-    
-    # Send image data for AI to recognize (if exists)
     reply = get_ai_response(msg, img_data)
-    
     db.execute("INSERT INTO messages VALUES(?,?,?)", (cid, "ai", reply))
-    
     db.execute("INSERT OR REPLACE INTO usage_limits VALUES(?,?,?,?)", (user, today, m_count+1, i_count + (1 if img_data else 0)))
     db.commit()
-    
     return jsonify({"reply": reply, "chat_id": cid, "usage": m_count+1, "img_usage": i_count + (1 if img_data else 0)})
 
-# ================= UI HTML (GEMINI GUI) =================
+# ================= UI HTML =================
 UI_HTML = """
 <!DOCTYPE html>
 <html>
@@ -161,83 +140,60 @@ UI_HTML = """
     <style>
         :root { --bg: #131314; --side: #1e1f20; --active: #333537; --text: #e3e3e3; --blue: #8ab4f8; --red: #ff6b6b; --border: #333; }
         body{margin:0; display:flex; height:100vh; background:var(--bg); color:var(--text); font-family:sans-serif; overflow:hidden;}
-        
-        /* Sidebar Updated */
-        .sidebar{width:260px; background:var(--side); padding:15px; display:flex; flex-direction:column; border-right:1px solid var(--border); transition: 0.3s;}
+        .sidebar{width:260px; background:var(--side); padding:15px; display:flex; flex-direction:column; border-right:1px solid var(--border);}
         .app-name{font-size: 24px; font-weight: bold; margin-bottom: 20px; color: #8ab4f8;}
         .new-btn{background:#2a2b2d; padding:12px; border-radius:30px; text-align:center; cursor:pointer; margin-bottom:15px; font-weight:bold; border:1px solid #444;}
-        
-        /* New: Search bar */
         .search-bar{background:#131314; border:1px solid #444; border-radius:10px; padding:8px 12px; margin-bottom:15px; display:flex; align-items:center;}
         .search-bar input{background:transparent; border:none; color:white; font-size:13px; width:100%; outline:none;}
-        
         .chat-list{flex:1; overflow-y:auto; scrollbar-width:none;}
-        .chat-item{padding:10px 15px; margin:4px 0; border-radius:20px; cursor:pointer; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+        .chat-item{padding:10px 15px; margin:4px 0; border-radius:10px; cursor:pointer; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
         .chat-item:hover, .chat-item.active{background:var(--active);}
-        
-        /* New: Settings at bottom */
-        .settings-btn{margin-top:auto; padding:12px; border-radius:10px; cursor:pointer; display:flex; align-items:center; gap:10px; font-size:14px; color:#aaa; text-decoration:none;}
+        .settings-btn{padding:12px; border-radius:10px; cursor:pointer; display:flex; align-items:center; gap:10px; font-size:14px; color:#aaa; text-decoration:none;}
         .settings-btn:hover{background:var(--active); color:white;}
-        
-        .main-section{ flex:1; display:flex; flex-direction:column; background:var(--bg); position: relative; }
+        .main-section{ flex:1; display:flex; flex-direction:column; position: relative; }
         .msgs{flex:1; overflow-y:auto; padding:20px 15%; display:flex; flex-direction:column; gap:25px; scroll-behavior: smooth;}
-        .msg{max-width:90%; line-height:1.6; font-size:16px; word-wrap: break-word;}
+        .msg{max-width:90%; line-height:1.6; font-size:16px; white-space: pre-wrap;}
         .user{align-self:flex-end; background:#2a2b2d; padding:12px 20px; border-radius:22px;}
-        .ai{align-self:flex-start; white-space:pre-wrap;}
-        .img-msg{max-width:300px; border-radius:10px; margin-top:10px;}
-        
+        .ai{align-self:flex-start;}
         .input-container{padding:15px 15%; display:flex; flex-direction:column; align-items:center; gap:8px;}
         .input-bar{width:100%; max-width:850px; background:#1e1f20; border-radius:35px; padding:8px 20px; display:flex; align-items:center; border:1px solid #444;}
         input#userInput{flex:1; background:transparent; border:none; color:white; padding:12px; outline:none; font-size:16px;}
-        
-        /* PLUS Icon (Left) & MIC Icon (Right) */
-        .icon-btn{background:transparent; border:none; color:#aaa; cursor:pointer; font-size:20px; padding:5px; margin:0 5px;}
+        .icon-btn{background:transparent; border:none; color:#aaa; cursor:pointer; font-size:20px; padding:5px;}
         .icon-btn:hover{color:white;}
-        .recording { color: var(--red) !important; animation: pulse 1.5s infinite; }
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
-        
-        /* Attachment Preview */
-        .attachment-preview{display:none; align-items:center; gap:10px; background:#2a2b2d; padding:8px 15px; border-radius:15px; margin-bottom:10px; border:1px solid var(--blue);}
-        .attachment-preview img{height:40px; border-radius:5px;}
-        .error-msg{color:var(--red); font-size:12px; font-weight:bold; display:none; margin-bottom:5px;}
-        
-        /* Usage Bar at TOP */
-        .usage-bar{padding:8px 20px; font-size:12px; color:#777; display:flex; justify-content:space-between; position: absolute; top: 0; width: 100%; box-sizing: border-box;}
+        .usage-bar{padding:8px 20px; font-size:12px; color:#777; position: absolute; top: 0; width: 100%;}
+        .attachment-preview{display:none; align-items:center; gap:10px; background:#2a2b2d; padding:8px 15px; border-radius:15px; margin-bottom:10px;}
+        .error-msg{color:var(--red); font-size:13px; font-weight:bold; display:none;}
+        .recording { color: var(--red) !important; }
     </style>
 </head>
 <body>
 <div class="sidebar">
     <div class="app-name">PERPLEX AI</div>
     <div class="new-btn" onclick="startFresh()">+ New Chat</div>
-    <div class="search-bar"><span>🔍</span><input type="text" id="sidebarSearch" placeholder="Search chats..." oninput="searchChats()"></div>
+    <div class="search-bar">🔍 <input type="text" id="sidebarSearch" placeholder="Search chats..." oninput="searchChats()"></div>
     <div class="chat-list" id="chatList"></div>
-    
-    <!-- New: Settings & Logout -->
-    <div style="border-top:1px solid var(--border); margin-top:10px; padding-top:10px;"></div>
-    <div class="settings-btn" onclick="showSettings()"><span>⚙️</span> Settings</div>
-    <a href="/logout" class="settings-btn"><span>🚪</span> Logout</a>
+    <div style="border-top:1px solid var(--border); margin:10px 0;"></div>
+    <div class="settings-btn" onclick="showSettings()">⚙️ Settings</div>
+    <a href="/logout" class="settings-btn">🚪 Logout</a>
 </div>
 <div class="main-section">
-    <!-- Updated Usage Bar -->
-    <div class="usage-bar"><span id="usageStat">Usage: 0/50 chats, 0/5 images</span><span>Powered by Gemini</span></div>
-    
+    <div class="usage-bar" id="usageStat">Usage: 0/50 chats, 0/5 images</div>
     <div class="msgs" id="chatBox">
         <div id="welcome" style="text-align:center; margin-top:20vh; opacity:0.5;">
-            <h1 style="font-size: 40px;">Hello, I'm Perplex AI</h1>
-            <p>I can help you with code, images, and more. Try uploading a photo.</p>
+            <h1>Hello, I'm Perplex AI</h1>
+            <p>Ready to help with your code and images.</p>
         </div>
     </div>
     <div class="input-container">
         <div id="limitError" class="error-msg"></div>
         <div class="attachment-preview" id="attachPreview">
-            <img id="prevImg" src=""><button onclick="clearAttachment()" style="background:none; border:none; color:var(--red); cursor:pointer;">✕</button>
+            <img id="prevImg" style="height:40px; border-radius:5px;">
+            <button onclick="clearAttachment()" style="background:none; border:none; color:var(--red); cursor:pointer;">✕</button>
         </div>
         <div class="input-bar">
-            <!-- Left: Plus Icon for upload -->
-            <button class="icon-btn" title="Upload Photo/Video" onclick="document.getElementById('fileInput').click()">+</button>
+            <button class="icon-btn" onclick="document.getElementById('fileInput').click()">+</button>
             <input id="userInput" placeholder="Type a message..." onkeypress="if(event.key=='Enter')send()">
-            <!-- Right: Mic Icon -->
-            <button class="icon-btn" id="micBtn" title="Voice to Text" onclick="toggleVoice()">🎙️</button>
+            <button class="icon-btn" id="micBtn" onclick="toggleVoice()">🎙️</button>
             <button class="icon-btn" id="sendBtn" onclick="send()" style="color:var(--blue);">➤</button>
         </div>
     </div>
@@ -250,94 +206,54 @@ UI_HTML = """
     let isRecording = false;
     let recognition;
 
-    // --- Voice to Text (Mic) Setup ---
     if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         recognition = new SpeechRecognition();
-        recognition.continuous = false;
-        recognition.interimResults = false;
-        recognition.lang = 'en-US';
-
-        recognition.onresult = (event) => {
-            const transcript = event.results[0][0].transcript;
-            document.getElementById("userInput").value = transcript;
-            stopVoice();
-        };
-        recognition.onerror = () => stopVoice();
-        recognition.onend = () => stopVoice();
+        recognition.onresult = (e) => { document.getElementById("userInput").value = e.results[0][0].transcript; stopVoice(); };
     }
 
-    function toggleVoice() {
-        if (!recognition) { alert("Voice recognition not supported."); return; }
-        if (isRecording) stopVoice(); else startVoice();
-    }
+    function toggleVoice() { if(isRecording) stopVoice(); else startVoice(); }
     function startVoice() { isRecording = true; document.getElementById("micBtn").classList.add("recording"); recognition.start(); }
-    function stopVoice() { isRecording = false; document.getElementById("micBtn").classList.remove("recording"); if (recognition) recognition.stop(); }
+    function stopVoice() { isRecording = false; document.getElementById("micBtn").classList.remove("recording"); recognition.stop(); }
 
-    // --- Image Preview & Recognition Setup ---
     function previewFile(input) {
-        if(input.files && input.files[0]) {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                currentBase64 = e.target.result;
-                document.getElementById("prevImg").src = currentBase64;
-                document.getElementById("attachPreview").style.display = 'flex';
-                document.getElementById("userInput").placeholder = "Ask something about this image...";
-            };
-            reader.readAsDataURL(input.files[0]);
-        }
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            currentBase64 = e.target.result;
+            document.getElementById("prevImg").src = currentBase64;
+            document.getElementById("attachPreview").style.display = 'flex';
+        };
+        reader.readAsDataURL(input.files[0]);
     }
-    function clearAttachment() { currentBase64 = null; document.getElementById("attachPreview").style.display = 'none'; document.getElementById("fileInput").value = ""; document.getElementById("userInput").placeholder = "Type a message..."; }
 
-    // --- Chat Functions ---
+    function clearAttachment() { currentBase64 = null; document.getElementById("attachPreview").style.display = 'none'; }
+
     function send() {
         const input = document.getElementById("userInput");
-        const val = input.value.trim();
-        if(!val && !currentBase64) return;
+        const text = input.value.trim();
+        if(!text && !currentBase64) return;
         const box = document.getElementById("chatBox");
         if(document.getElementById("welcome")) box.innerHTML = "";
-        
-        let userMsg = `<div class="msg user">`;
-        if(currentBase64) userMsg += `<img src="${currentBase64}" class="img-msg"><br>`;
-        userMsg += `${val}</div>`;
-        box.innerHTML += userMsg;
-        
-        const text = val;
+        box.innerHTML += `<div class="msg user">${text}</div>`;
         input.value = "";
         box.scrollTop = box.scrollHeight;
-
         const fd = new FormData();
         fd.append("chat", activeChatId);
         fd.append("msg", text);
         if(currentBase64) fd.append("image", currentBase64);
-
-        document.getElementById("sendBtn").innerText = "⌛";
         fetch("/send", {method:"POST", body:fd}).then(r=>r.json()).then(data => {
-            document.getElementById("sendBtn").innerText = "➤";
-            const limitErrorBox = document.getElementById("limitError");
             if(data.error) {
-                // RED Error Message for limits
-                limitErrorBox.innerText = data.error;
-                limitErrorBox.style.display = 'block';
+                document.getElementById("limitError").innerText = data.error;
+                document.getElementById("limitError").style.display = 'block';
                 return;
             }
-            limitErrorBox.style.display = 'none';
+            document.getElementById("limitError").style.display = 'none';
             activeChatId = data.chat_id;
             box.innerHTML += `<div class="msg ai">${data.reply}</div>`;
             box.scrollTop = box.scrollHeight;
             document.getElementById("usageStat").innerText = `Usage: ${data.usage}/50 chats, ${data.img_usage}/5 images`;
             clearAttachment();
             loadChatList();
-        });
-    }
-
-    // --- Search Chats ---
-    function searchChats() {
-        const query = document.getElementById("sidebarSearch").value.toLowerCase();
-        const items = document.querySelectorAll(".chat-item");
-        items.forEach(item => {
-            if(item.innerText.toLowerCase().includes(query)) item.style.display = 'block';
-            else item.style.display = 'none';
         });
     }
 
@@ -366,35 +282,31 @@ UI_HTML = """
         });
     }
 
-    function startFresh() {
-        activeChatId = "";
-        document.getElementById("chatBox").innerHTML = '<div id="welcome" style="text-align:center; margin-top:20vh; opacity:0.5;"><h1>PERPLEX AI</h1><p>Created by Nihit kr.</p></div>';
-        loadChatList();
+    function startFresh() { activeChatId = ""; document.getElementById("chatBox").innerHTML = ""; loadChatList(); }
+    
+    function searchChats() {
+        const q = document.getElementById("sidebarSearch").value.toLowerCase();
+        document.querySelectorAll(".chat-item").forEach(i => {
+            i.style.display = i.innerText.toLowerCase().includes(q) ? 'block' : 'none';
+        });
     }
 
-    // --- New: Settings Overlay ---
     function showSettings() {
-        const html = `
-            <div id="settingsModal" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); display:flex; align-items:center; justify-content:center; z-index:1000;">
-                <div style="background:var(--side); padding:30px; border-radius:15px; width:400px; border:1px solid var(--border);">
-                    <h2>Settings</h2>
-                    <p style="color:#aaa; font-size:14px;">Cookies Preferences: Managed automatically.</p>
-                    <button onclick="deleteHistory()" style="background:var(--red); color:white; border:none; padding:10px 20px; border-radius:5px; cursor:pointer; width:100%; font-weight:bold;">🗑️ Delete All Chat History</button>
-                    <br><br>
-                    <button onclick="document.getElementById('settingsModal').remove()" style="background:var(--active); color:white; border:none; padding:10px; border-radius:5px; cursor:pointer; width:100%;">Close</button>
-                </div>
+        const html = `<div id="settingsModal" style="position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); display:flex; align-items:center; justify-content:center; z-index:1000;">
+            <div style="background:var(--side); padding:30px; border-radius:15px; width:350px; border:1px solid var(--border);">
+                <h3>Settings</h3>
+                <p style="color:#aaa; font-size:12px;">Cookies preferences managed.</p>
+                <button onclick="deleteHistory()" style="background:var(--red); color:white; border:none; padding:12px; border-radius:5px; cursor:pointer; width:100%; font-weight:bold;">🗑️ Delete All Chat History</button>
+                <button onclick="document.getElementById('settingsModal').remove()" style="margin-top:10px; background:#444; color:white; border:none; padding:8px; border-radius:5px; cursor:pointer; width:100%;">Close</button>
             </div>
-        `;
+        </div>`;
         document.body.insertAdjacentHTML('beforeend', html);
     }
+
     function deleteHistory() {
-        if(!confirm("Are you sure? All chats and messages will be permanently deleted.")) return;
-        fetch("/delete_history", {method:"POST"}).then(r=>r.json()).then(data => {
-            if(data.success) {
-                alert("History deleted.");
-                location.reload();
-            }
-        });
+        if(confirm("Delete everything?")) {
+            fetch("/delete_history", {method:"POST"}).then(() => location.reload());
+        }
     }
 
     loadChatList();
