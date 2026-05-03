@@ -1,17 +1,16 @@
 from flask import Flask, request, jsonify, session, redirect, url_for, g
 from authlib.integrations.flask_client import OAuth
 from werkzeug.middleware.proxy_fix import ProxyFix
-import sqlite3, time, requests, json, os, base64, re
-from datetime import timedelta, datetime
+import sqlite3, time, requests, json, os, datetime
+from datetime import timedelta
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-app.secret_key = os.environ.get("SECRET_KEY", "perplex_ultra_pro_v9_ultimate")
+app.secret_key = os.environ.get("SECRET_KEY", "perplex_ultra_pro_v10")
 app.config['SESSION_PERMANENT'] = True
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
 
-# ================= DATABASE MANAGEMENT =================
 DATABASE = 'perplex_ai.db'
 
 def get_db():
@@ -20,18 +19,16 @@ def get_db():
         db = g._database = sqlite3.connect(DATABASE)
         db.execute("CREATE TABLE IF NOT EXISTS chats(id TEXT, user TEXT, title TEXT)")
         db.execute("CREATE TABLE IF NOT EXISTS messages(chat_id TEXT, role TEXT, content TEXT)")
-        db.execute("CREATE TABLE IF NOT EXISTS user_memory(user TEXT PRIMARY KEY, memory_data TEXT)")
-        db.execute("CREATE TABLE IF NOT EXISTS usage(user TEXT, date TEXT, msg_count INTEGER, img_count INTEGER, PRIMARY KEY(user, date))")
+        db.execute("CREATE TABLE IF NOT EXISTS usage(user TEXT, date TEXT, count INTEGER, PRIMARY KEY(user, date))")
         db.commit()
     return db
 
 @app.teardown_appcontext
 def close_connection(exception):
     db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
+    if db is not None: db.close()
 
-# ================= GOOGLE AUTH CONFIG =================
+# --- Auth Setup ---
 oauth = OAuth(app)
 google = oauth.register(
     name='google',
@@ -41,234 +38,160 @@ google = oauth.register(
     client_kwargs={"scope": "email profile"}
 )
 
-# ================= AI ENGINE =================
-OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY")
-
-def get_ai_response(msg, chat_id, user_email, img_base64=None):
+# --- AI Engine ---
+def get_ai_response(msg, chat_id, user_email):
     try:
         db = get_db()
-        mem_res = db.execute("SELECT memory_data FROM user_memory WHERE user=?", (user_email,)).fetchone()
-        user_memory_context = mem_res[0] if mem_res else "No previous memory."
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        history_rows = db.execute("SELECT role, content FROM messages WHERE chat_id=? ORDER BY rowid DESC LIMIT 6", (chat_id,)).fetchall()
-        chat_history = [{"role": h[0], "content": h[1]} for h in reversed(history_rows)]
-
-        system_prompt = f"You are Perplex AI. Sense: {current_time}. Memory: {user_memory_context}. Use ```html blocks for large code to trigger Canvas UI."
+        # Fetching context
+        history = db.execute("SELECT role, content FROM messages WHERE chat_id=? ORDER BY rowid DESC LIMIT 5", (chat_id,)).fetchall()
+        msgs = [{"role": h[0], "content": h[1]} for h in reversed(history)]
         
-        user_content = [{"type": "text", "text": msg}]
-        if img_base64:
-            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}})
+        system_msg = {"role": "system", "content": "You are Perplex AI, a helpful assistant. Use markdown for formatting."}
+        msgs.insert(0, system_msg)
+        msgs.append({"role": "user", "content": msg})
 
-        payload = {
-            "model": "google/gemini-2.0-flash-001",
-            "messages": [{"role": "system", "content": system_prompt}] + chat_history + [{"role": "user", "content": user_content}]
-        }
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {os.environ.get('OPENROUTER_KEY')}"},
+            data=json.dumps({
+                "model": "google/gemini-2.0-flash-001",
+                "messages": msgs
+            }),
+            timeout=30
+        )
+        
+        res_json = response.json()
+        if "choices" in res_json:
+            return res_json["choices"][0]["message"]["content"]
+        else:
+            print(f"API Error: {res_json}") # Log this in Railway logs
+            return "Bhai, API key check karo ya model load nahi ho raha."
+    except Exception as e:
+        print(f"Server Error: {str(e)}")
+        return "Network issues, please try again."
 
-        r = requests.post("[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)", headers={"Authorization": f"Bearer {OPENROUTER_KEY}"}, json=payload, timeout=60)
-        return r.json()["choices"][0]["message"]["content"]
-    except: return "Bhai error aa gaya server mein."
-
-# ================= ROUTES =================
+# --- Routes ---
 @app.route("/")
 def index():
-    return redirect("/chat") if "user" in session else UI_HTML_LOGIN
+    return redirect("/chat") if "user" in session else UI_LOGIN
 
 @app.route("/login")
 def login():
-    return google.authorize_redirect(url_for('callback', _external=True, _scheme='https'))
+    return google.authorize_redirect(url_for('callback', _external=True))
 
 @app.route("/callback")
 def callback():
     token = google.authorize_access_token()
-    session["user"] = google.get("[https://www.googleapis.com/oauth2/v2/userinfo](https://www.googleapis.com/oauth2/v2/userinfo)").json()["email"]
+    session["user"] = google.get("https://www.googleapis.com/oauth2/v2/userinfo").json()["email"]
     return redirect("/chat")
 
 @app.route("/chat")
-def chat_page():
+def chat_ui():
     if "user" not in session: return redirect("/")
-    today = datetime.now().strftime('%Y-%m-%d')
-    res = get_db().execute("SELECT msg_count FROM usage WHERE user=? AND date=?", (session['user'], today)).fetchone()
-    count = res[0] if res else 0
-    return UI_HTML.replace("{{msg_usage}}", str(count))
+    return UI_MAIN
 
 @app.route("/send", methods=["POST"])
-def send_msg():
-    db = get_db()
+def handle_msg():
     user = session.get("user")
-    msg, img, cid = request.form.get("msg"), request.form.get("image"), request.form.get("chat")
-    
-    today = datetime.now().strftime('%Y-%m-%d')
-    res = db.execute("SELECT msg_count, img_count FROM usage WHERE user=? AND date=?", (user, today)).fetchone()
-    m_count, i_count = (res[0], res[1]) if res else (0, 0)
+    data = request.json
+    msg, cid = data.get("msg"), data.get("chat_id")
+    db = get_db()
 
-    if m_count >= 50: return jsonify({"reply": "❌ Daily Limit Exceeded (50 chats)!"})
-    if img and i_count >= 5: return jsonify({"reply": "❌ Image Limit Exceeded!"})
-
-    if not cid or cid == "null":
-        cid = str(int(time.time()*1000))
+    if not cid:
+        cid = str(int(time.time()))
         db.execute("INSERT INTO chats VALUES(?,?,?)", (cid, user, msg[:30]))
     
-    reply = get_ai_response(msg, cid, user, img)
+    reply = get_ai_response(msg, cid, user)
     db.execute("INSERT INTO messages VALUES(?,?,?)", (cid, "user", msg))
     db.execute("INSERT INTO messages VALUES(?,?,?)", (cid, "assistant", reply))
-    db.execute("INSERT OR REPLACE INTO usage VALUES(?,?,?,?)", (user, today, m_count + 1, i_count + (1 if img else 0)))
     db.commit()
     
-    return jsonify({"reply": reply, "chat_id": cid, "new_usage": m_count + 1})
+    return jsonify({"reply": reply, "chat_id": cid})
 
 @app.route("/history")
-def history():
-    rows = get_db().execute("SELECT id, title FROM chats WHERE user=? ORDER BY id DESC", (session['user'],)).fetchall()
-    return jsonify(rows)
+def get_history():
+    rows = get_db().execute("SELECT id, title FROM chats WHERE user=? ORDER BY id DESC", (session.get('user'),)).fetchall()
+    return jsonify([{"id": r[0], "title": r[1]} for r in rows])
 
-@app.route("/msgs")
-def get_msgs():
-    rows = get_db().execute("SELECT role, content FROM messages WHERE chat_id=?", (request.args.get("c"),)).fetchall()
-    return jsonify(rows)
+# --- Minimalistic Pro UI ---
+UI_LOGIN = """<body style="background:#000;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
+<div style="text-align:center;"><h1>Perplex AI</h1><a href="/login" style="background:#fff;color:#000;padding:10px 20px;text-decoration:none;border-radius:5px;font-weight:bold;">Sign in with Google</a></div></body>"""
 
-@app.route("/clear", methods=["POST"])
-def clear():
-    get_db().execute("DELETE FROM chats WHERE user=?", (session['user'],))
-    get_db().commit()
-    return jsonify({"success": True})
-
-# ================= UI HTML =================
-UI_HTML_LOGIN = """
+UI_MAIN = """
 <!DOCTYPE html>
-<html>
-<head><title>Perplex AI Login</title><style>body{background:#0a0a0a;color:white;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;}a{padding:15px 30px;background:#fff;color:#000;text-decoration:none;border-radius:50px;font-weight:bold;}</style></head>
-<body><h1>PERPLEX AI</h1><p>Created by Nihit kr.</p><a href="/login">Login with Google</a></body></html>"""
-
-UI_HTML = """
-<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Perplex AI</title>
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Perplex AI</title>
     <style>
-        :root { --bg: #0d0d0d; --panel: #161616; --accent: #2563eb; --border: #222; }
-        body { margin:0; background:var(--bg); color:#eee; font-family: sans-serif; display:flex; height:100vh; overflow:hidden; }
-        .sidebar { width:260px; background:var(--panel); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:15px; }
-        .main { flex:1; display:flex; position:relative; }
-        .chat-area { flex:1; display:flex; flex-direction:column; transition: 0.3s; }
-        #box { flex:1; overflow-y:auto; padding:20px 10%; display:flex; flex-direction:column; gap:15px; }
-        .msg { padding:12px; border-radius:12px; max-width:85%; font-size:15px; }
-        .user { align-self:flex-end; background:var(--accent); }
-        .assistant { align-self:flex-start; background:#222; border:1px solid #333; }
-        .input-wrap { padding:20px 10%; border-top:1px solid var(--border); }
-        .bar { background:#1e1e1e; border-radius:25px; padding:10px 20px; display:flex; align-items:center; gap:12px; border:1px solid #333; }
-        input[type="text"] { flex:1; background:transparent; border:none; color:white; outline:none; }
-        #canvas { width:50%; background:#000; border-left:1px solid var(--border); display:none; flex-direction:column; }
-        .plus-btn { cursor:pointer; font-size:24px; color:#888; position:relative; }
-        .plus-menu { position:absolute; bottom:55px; left:0; background:#222; border:1px solid #444; border-radius:8px; display:none; flex-direction:column; width:160px; z-index:100; }
-        .plus-menu div { padding:12px; cursor:pointer; border-bottom:1px solid #333; }
-        #sendBtn { background:var(--accent); color:white; border:none; padding:8px 18px; border-radius:20px; cursor:pointer; }
-        #stopBtn { background:#d32f2f; color:white; border:none; padding:8px 18px; border-radius:20px; cursor:pointer; display:none; }
+        * { box-sizing: border-box; }
+        body { margin: 0; background: #131314; color: #e3e3e3; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; height: 100vh; }
+        .sidebar { width: 260px; background: #1e1f20; display: flex; flex-direction: column; padding: 15px; border-right: 1px solid #333; }
+        .new-chat { background: #333; border: none; color: white; padding: 12px; border-radius: 8px; cursor: pointer; margin-bottom: 20px; font-weight: bold; }
+        .history { flex: 1; overflow-y: auto; }
+        .history-item { padding: 10px; border-radius: 5px; cursor: pointer; margin-bottom: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
+        .history-item:hover { background: #2d2e2f; }
+        .main-chat { flex: 1; display: flex; flex-direction: column; }
+        #chat-container { flex: 1; overflow-y: auto; padding: 40px 15% 100px 15%; display: flex; flex-direction: column; gap: 20px; }
+        .bubble { max-width: 85%; padding: 12px 16px; border-radius: 15px; line-height: 1.5; font-size: 16px; }
+        .user-bubble { align-self: flex-end; background: #2d2e2f; color: #fff; }
+        .ai-bubble { align-self: flex-start; background: transparent; border: 1px solid #333; }
+        .input-area { position: fixed; bottom: 30px; left: 50%; transform: translateX(-10%); width: 50%; background: #1e1f20; border-radius: 24px; padding: 10px 20px; display: flex; align-items: center; border: 1px solid #444; }
+        input { flex: 1; background: transparent; border: none; color: white; outline: none; padding: 10px; font-size: 16px; }
+        .send-btn { background: #fff; color: #000; border: none; border-radius: 50%; width: 35px; height: 35px; cursor: pointer; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="sidebar">
-        <h2 style="color:var(--accent)">PERPLEX AI</h2>
-        <button onclick="location.reload()" style="background:#333; color:white; padding:10px; border:none; border-radius:8px; cursor:pointer;">+ New Chat</button>
-        <input type="text" id="srch" placeholder="Search chats..." oninput="filter()" style="margin-top:10px; padding:8px; background:#000; border:1px solid #333; color:white; border-radius:5px;">
-        <div id="hist" style="flex:1; overflow-y:auto; margin-top:15px;"></div>
-        <div onclick="toggleSett()" style="cursor:pointer; color:#555; padding:10px;">⚙️ Settings</div>
+        <h2 style="margin: 0 0 20px 0; color: #4285f4;">Perplex AI</h2>
+        <button class="new-chat" onclick="window.location.reload()">+ New Chat</button>
+        <div class="history" id="history-list"></div>
+        <div style="margin-top: auto; padding-top: 10px; font-size: 12px; color: #888;">NihitXFire Edition v10</div>
     </div>
-
-    <div class="main">
-        <div class="chat-area" id="chatArea">
-            <div style="position:absolute; top:10px; left:20px; font-size:12px; color:#555;">Daily Usage: <span id="u-tag">{{msg_usage}}</span>/50</div>
-            <div id="box"></div>
-            <div class="input-wrap">
-                <div id="p-box" style="display:none; margin-bottom:10px;"><img id="p-img" style="height:50px; border-radius:5px;"></div>
-                <div class="bar">
-                    <div class="plus-btn" onclick="togglePlus()">+
-                        <div class="plus-menu" id="p-menu">
-                            <div onclick="document.getElementById('f').click()">🖼️ Upload Photo</div>
-                            <div onclick="openCvs()">🎨 Open Canvas</div>
-                        </div>
-                    </div>
-                    <input type="file" id="f" hidden onchange="pre(this)">
-                    <input type="text" id="in" placeholder="Ask Nihit's AI..." onkeypress="if(event.key=='Enter')send()">
-                    <button id="sendBtn" onclick="send()">Send</button>
-                    <button id="stopBtn" onclick="stop()">Stop</button>
-                </div>
-            </div>
+    <div class="main-chat">
+        <div id="chat-container"></div>
+        <div class="input-area">
+            <input type="text" id="user-input" placeholder="Ask anything..." onkeypress="if(event.key=='Enter')sendMessage()">
+            <button class="send-btn" onclick="sendMessage()">➔</button>
         </div>
-        <div id="canvas">
-            <div style="padding:10px; background:#111; display:flex; justify-content:space-between;">
-                <span>Canvas</span>
-                <div><button onclick="run()">Run</button> <button onclick="openCvs(false)">✕</button></div>
-            </div>
-            <textarea id="code" style="flex:1; background:#000; color:#0f0; padding:15px; border:none; font-family:monospace; outline:none; resize:none;"></textarea>
-            <iframe id="out" style="height:45%; background:white; border:none; width:100%;"></iframe>
-        </div>
-    </div>
-
-    <div id="sett" style="display:none; position:fixed; bottom:60px; left:20px; background:#222; padding:15px; border-radius:10px; border:1px solid #444; z-index:1000;">
-        <div onclick="clearAll()" style="color:red; cursor:pointer;">🗑️ Clear History</div>
-        <div onclick="alert(document.cookie)" style="margin-top:10px; cursor:pointer;">🍪 Cookies</div>
     </div>
 
     <script>
-        let cid = null, img = null, controller = null;
+        let currentChatId = null;
 
-        async function send() {
-            const i = document.getElementById("in");
-            if(!i.value && !img) return;
-            const b = document.getElementById("box");
-            b.innerHTML += `<div class="msg user">${i.value}</div>`;
-            const val = i.value; i.value = "";
-            b.scrollTop = b.scrollHeight;
+        async function sendMessage() {
+            const input = document.getElementById('user-input');
+            const container = document.getElementById('chat-container');
+            if(!input.value.trim()) return;
 
-            document.getElementById("sendBtn").style.display = "none";
-            document.getElementById("stopBtn").style.display = "block";
-            controller = new AbortController();
+            const userMsg = input.value;
+            input.value = '';
+            
+            container.innerHTML += `<div class="bubble user-bubble">${userMsg}</div>`;
+            container.scrollTop = container.scrollHeight;
 
-            const fd = new FormData();
-            fd.append("msg", val); fd.append("chat", cid);
-            if(img) fd.append("image", img);
+            const res = await fetch('/send', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({msg: userMsg, chat_id: currentChatId})
+            });
+            const data = await res.json();
+            currentChatId = data.chat_id;
 
-            try {
-                const r = await fetch("/send", {method:"POST", body:fd, signal: controller.signal});
-                const d = await r.json();
-                cid = d.chat_id;
-                let reply = d.reply;
-                if(reply.includes("```html")) {
-                    openCvs(true);
-                    document.getElementById("code").value = reply.match(/```html([\\s\\S]*?)```/)[1].trim();
-                    reply = reply.replace(/```html[\\s\\S]*?```/g, "*(Code opened in Canvas)*");
-                }
-                b.innerHTML += `<div class="msg assistant">${reply}</div>`;
-                document.getElementById("u-tag").innerText = d.new_usage || "{{msg_usage}}";
-            } catch(e) {}
-
-            document.getElementById("sendBtn").style.display = "block";
-            document.getElementById("stopBtn").style.display = "none";
-            img = null; document.getElementById("p-box").style.display="none";
-            b.scrollTop = b.scrollHeight;
-            loadHist();
+            container.innerHTML += `<div class="bubble ai-bubble">${data.reply}</div>`;
+            container.scrollTop = container.scrollHeight;
+            loadHistory();
         }
 
-        function stop() { if(controller) controller.abort(); }
-        function pre(i) {
-            const r = new FileReader();
-            r.onload = (e) => {
-                img = e.target.result.split(',')[1];
-                document.getElementById("p-img").src = e.target.result;
-                document.getElementById("p-box").style.display = "block";
-            };
-            r.readAsDataURL(i.files[0]); togglePlus();
+        async function loadHistory() {
+            const res = await fetch('/history');
+            const data = await res.json();
+            const list = document.getElementById('history-list');
+            list.innerHTML = data.map(item => `<div class="history-item"># ${item.title}</div>`).join('');
         }
-        function openCvs(s=true) { document.getElementById("canvas").style.display = s?"flex":"none"; document.getElementById("chatArea").style.flex = s?"0.5":"1"; }
-        function run() { const f = document.getElementById("out").contentWindow.document; f.open(); f.write(document.getElementById("code").value); f.close(); }
-        function togglePlus() { const m = document.getElementById("p-menu"); m.style.display = m.style.display==="flex"?"none":"flex"; }
-        function toggleSett() { const s = document.getElementById("sett"); s.style.display = s.style.display==="block"?"none":"block"; }
-        function filter() { const q = document.getElementById("srch").value.toLowerCase(); document.querySelectorAll(".h-i").forEach(i => i.style.display = i.innerText.toLowerCase().includes(q)?"block":"none"); }
-        function loadHist() { fetch("/history").then(r=>r.json()).then(data => { const h = document.getElementById("hist"); h.innerHTML = ""; data.forEach(c => h.innerHTML += `<div class="h-i" style="padding:10px; cursor:pointer; border-bottom:1px solid #222;" onclick="location.href='/chat?c=${c[0]}'"># ${c[1]}</div>`); }); }
-        function clearAll() { if(confirm("Saari history uda dein?")) fetch("/clear", {method:"POST"}).then(()=>location.reload()); }
-        loadHist();
+
+        loadHistory();
     </script>
 </body>
 </html>
