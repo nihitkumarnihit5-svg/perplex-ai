@@ -1,26 +1,34 @@
 import os, sqlite3, time, requests, json, base64
-from flask import Flask, request, jsonify, session, redirect, url_for
+from flask import Flask, request, jsonify, session, redirect, url_for, g
 from authlib.integrations.flask_client import OAuth
 from datetime import datetime
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-app.secret_key = os.environ.get("SECRET_KEY", "nihit_final_v10")
+app.secret_key = os.environ.get("SECRET_KEY", "perplex_final_stable_v10")
 
-# ================= DATABASE SETUP =================
+# ================= DATABASE MANAGEMENT =================
+DATABASE = 'perplex_ai.db'
+
 def get_db():
-    conn = sqlite3.connect("perplex.db", check_same_thread=False)
-    conn.execute("CREATE TABLE IF NOT EXISTS chats(id TEXT, user TEXT, title TEXT)")
-    conn.execute("CREATE TABLE IF NOT EXISTS messages(chat_id TEXT, role TEXT, content TEXT)")
-    conn.execute("CREATE TABLE IF NOT EXISTS user_memory(user TEXT PRIMARY KEY, memory TEXT)")
-    conn.execute("CREATE TABLE IF NOT EXISTS usage(user TEXT, date TEXT, count INTEGER, PRIMARY KEY(user, date))")
-    conn.commit()
-    return conn
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DATABASE)
+        db.execute("CREATE TABLE IF NOT EXISTS chats(id TEXT, user TEXT, title TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS messages(chat_id TEXT, role TEXT, content TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS user_memory(user TEXT PRIMARY KEY, memory TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS usage(user TEXT, date TEXT, count INTEGER, PRIMARY KEY(user, date))")
+        db.commit()
+    return db
 
-db = get_db()
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
 
-# ================= AUTH =================
+# ================= AUTH SETUP =================
 oauth = OAuth(app)
 google = oauth.register(
     name='google',
@@ -30,19 +38,17 @@ google = oauth.register(
     client_kwargs={"scope": "email profile"}
 )
 
-# ================= AI LOGIC =================
+# ================= AI ENGINE =================
 def get_ai_response(msg, chat_id, user_email, img_b64=None):
     try:
-        # Sense & Memory
+        db = get_db()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         mem = db.execute("SELECT memory FROM user_memory WHERE user=?", (user_email,)).fetchone()
-        mem_data = mem[0] if mem else "No facts known."
-
-        # History
-        hist = db.execute("SELECT role, content FROM messages WHERE chat_id=? ORDER BY rowid DESC LIMIT 10", (chat_id,)).fetchall()
+        
+        hist = db.execute("SELECT role, content FROM messages WHERE chat_id=? ORDER BY rowid DESC LIMIT 8", (chat_id,)).fetchall()
         messages = [{"role": h[0], "content": h[1]} for h in reversed(hist)]
 
-        sys_prompt = f"You are Perplex AI. Current Time: {now}. User Memory: {mem_data}. If code is asked, wrap it in ```html blocks for the Canvas view."
+        sys_prompt = f"Sense: {now}. Memory: {mem[0] if mem else ''}. Always use ```html blocks for code to trigger Canvas."
         
         user_content = [{"type": "text", "text": msg}]
         if img_b64:
@@ -53,16 +59,15 @@ def get_ai_response(msg, chat_id, user_email, img_b64=None):
             "messages": [{"role": "system", "content": sys_prompt}] + messages + [{"role": "user", "content": user_content}]
         }
         
-        headers = {"Authorization": f"Bearer {os.environ.get('OPENROUTER_KEY')}"}
-        r = requests.post("[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)", headers=headers, json=payload, timeout=60)
+        r = requests.post("[https://openrouter.ai/api/v1/chat/completions](https://openrouter.ai/api/v1/chat/completions)", 
+                         headers={"Authorization": f"Bearer {os.environ.get('OPENROUTER_KEY')}"}, 
+                         json=payload, timeout=45)
         return r.json()['choices'][0]['message']['content']
-    except Exception as e:
-        return f"Bhai error aa gaya: {str(e)}"
+    except Exception as e: return f"Error: {str(e)}"
 
 # ================= ROUTES =================
 @app.route("/")
-def home():
-    return redirect("/chat") if "user" in session else '<h1>PERPLEX AI</h1><a href="/login">Login with Google</a>'
+def index(): return redirect("/chat") if "user" in session else '<a href="/login">Login with Google</a>'
 
 @app.route("/login")
 def login(): return google.authorize_redirect(url_for('callback', _external=True, _scheme='https'))
@@ -73,49 +78,47 @@ def callback():
     return redirect("/chat")
 
 @app.route("/chat")
-def chat_ui():
+def chat():
     if "user" not in session: return redirect("/")
     today = datetime.now().strftime('%Y-%m-%d')
-    res = db.execute("SELECT count FROM usage WHERE user=? AND date=?", (session['user'], today)).fetchone()
-    count = res[0] if res else 0
-    return UI_HTML.replace("{{count}}", str(count))
+    res = get_db().execute("SELECT count FROM usage WHERE user=? AND date=?", (session['user'], today)).fetchone()
+    return UI_HTML.replace("{{count}}", str(res[0] if res else 0))
 
 @app.route("/send", methods=["POST"])
-def send():
+def send_msg():
+    db = get_db()
     user = session.get("user")
     msg, img, cid = request.form.get("msg"), request.form.get("image"), request.form.get("chat")
     
     today = datetime.now().strftime('%Y-%m-%d')
     res = db.execute("SELECT count FROM usage WHERE user=? AND date=?", (user, today)).fetchone()
-    current_usage = res[0] if res else 0
+    current_count = res[0] if res else 0
     
-    if current_usage >= 50: return jsonify({"reply": "❌ Daily Limit Exceeded (50 chats)!"})
+    if current_count >= 50: return jsonify({"reply": "Limit Exceeded (50/50)"})
     
     if not cid or cid == "null":
         cid = str(int(time.time()))
-        db.execute("INSERT INTO chats VALUES(?,?,?)", (cid, user, msg[:30]))
+        db.execute("INSERT INTO chats VALUES(?,?,?)", (cid, user, msg[:25]))
     
     reply = get_ai_response(msg, cid, user, img)
-    
     db.execute("INSERT INTO messages VALUES(?,?,?)", (cid, "user", msg))
     db.execute("INSERT INTO messages VALUES(?,?,?)", (cid, "assistant", reply))
-    db.execute("INSERT OR REPLACE INTO usage VALUES(?,?,?)", (user, today, current_usage + 1))
+    db.execute("INSERT OR REPLACE INTO usage VALUES(?,?,?)", (user, today, current_count + 1))
     db.commit()
-    
-    return jsonify({"reply": reply, "chat_id": cid, "new_count": current_usage + 1})
+    return jsonify({"reply": reply, "chat_id": cid, "new_count": current_count + 1})
 
-@app.route("/get_history")
-def get_history():
-    rows = db.execute("SELECT id, title FROM chats WHERE user=? ORDER BY id DESC", (session['user'],)).fetchall()
+@app.route("/history")
+def history():
+    rows = get_db().execute("SELECT id, title FROM chats WHERE user=? ORDER BY id DESC", (session['user'],)).fetchall()
     return jsonify(rows)
 
 @app.route("/clear", methods=["POST"])
 def clear():
-    db.execute("DELETE FROM chats WHERE user=?", (session['user'],))
-    db.commit()
+    get_db().execute("DELETE FROM chats WHERE user=?", (session['user'],))
+    get_db().commit()
     return jsonify({"status": "ok"})
 
-# ================= HTML UI =================
+# ================= UI HTML =================
 UI_HTML = """
 <!DOCTYPE html>
 <html>
@@ -125,152 +128,126 @@ UI_HTML = """
     <style>
         body { margin:0; background:#0d0d0d; color:#eee; font-family: sans-serif; display:flex; height:100vh; overflow:hidden; }
         .sidebar { width:260px; background:#161616; border-right:1px solid #222; display:flex; flex-direction:column; padding:15px; }
-        .main { flex:1; display:flex; position:relative; }
-        #chat-window { flex:1; display:flex; flex-direction:column; border-right:1px solid #222; transition: 0.3s; }
+        .main { flex:1; display:flex; position:relative; overflow:hidden; }
+        #chat-pane { flex:1; display:flex; flex-direction:column; transition: 0.3s; }
         #box { flex:1; overflow-y:auto; padding:20px 10%; display:flex; flex-direction:column; gap:15px; }
-        .msg { padding:12px; border-radius:12px; max-width:85%; font-size:15px; line-height:1.5; }
+        .msg { padding:12px; border-radius:12px; max-width:85%; font-size:15px; }
         .user { align-self:flex-end; background:#2563eb; }
         .assistant { align-self:flex-start; background:#222; border:1px solid #333; }
         .input-area { padding:20px 10%; border-top:1px solid #222; }
-        .input-bar { background:#1e1e1e; border-radius:25px; padding:8px 20px; display:flex; align-items:center; gap:12px; border:1px solid #333; }
-        input[type="text"] { flex:1; background:transparent; border:none; color:white; outline:none; font-size:16px; }
+        .bar { background:#1e1e1e; border-radius:25px; padding:10px 20px; display:flex; align-items:center; gap:12px; border:1px solid #333; }
+        input[type="text"] { flex:1; background:transparent; border:none; color:white; outline:none; }
+        #canvas { width:50%; background:#000; border-left:1px solid #222; display:none; flex-direction:column; }
         .plus-btn { cursor:pointer; font-size:24px; color:#888; position:relative; }
         .plus-menu { position:absolute; bottom:55px; left:0; background:#222; border:1px solid #444; border-radius:8px; display:none; flex-direction:column; width:160px; z-index:100; }
-        .plus-menu div { padding:12px; font-size:14px; cursor:pointer; border-bottom:1px solid #333; }
-        .plus-menu div:hover { background:#2563eb; }
-        #canvas { width:50%; background:#000; border-left:1px solid #222; display:none; flex-direction:column; }
-        button { cursor:pointer; border:none; border-radius:20px; padding:8px 18px; font-weight:bold; }
-        #send-btn { background:#2563eb; color:white; }
-        #stop-btn { background:#d32f2f; color:white; display:none; }
+        .plus-menu div { padding:12px; font-size:14px; cursor:pointer; }
+        #send-btn { background:#2563eb; color:white; border:none; padding:8px 15px; border-radius:20px; cursor:pointer; }
+        #stop-btn { background:#d32f2f; color:white; border:none; padding:8px 15px; border-radius:20px; cursor:pointer; display:none; }
     </style>
 </head>
 <body>
     <div class="sidebar">
         <h2 style="color:#2563eb; margin:0 0 15px 0;">PERPLEX</h2>
-        <button onclick="location.reload()" style="background:#333; color:white; margin-bottom:10px;">+ New Chat</button>
-        <input type="text" id="search" placeholder="Search chats..." oninput="filterChats()" style="padding:10px; background:#000; border:1px solid #333; color:white; border-radius:8px; outline:none;">
-        <div id="history" style="flex:1; overflow-y:auto; margin-top:15px;"></div>
-        <div onclick="toggleSettings()" style="cursor:pointer; color:#777; padding:10px; font-size:14px;">⚙️ Settings</div>
+        <button onclick="location.reload()" style="background:#333; color:white; padding:10px; border:none; border-radius:8px; cursor:pointer;">+ New Chat</button>
+        <input type="text" id="srch" placeholder="Search chats..." oninput="filter()" style="margin-top:10px; padding:8px; background:#000; border:1px solid #333; color:white; border-radius:5px;">
+        <div id="hist" style="flex:1; overflow-y:auto; margin-top:15px;"></div>
+        <div onclick="toggleSett()" style="cursor:pointer; color:#555; font-size:13px; padding-top:10px;">⚙️ Settings</div>
     </div>
 
     <div class="main">
-        <div id="chat-window">
-            <div style="position:absolute; top:10px; left:20px; font-size:12px; color:#555;">Usage: <span id="usage-tag">{{count}}</span>/50</div>
+        <div id="chat-pane">
+            <div style="position:absolute; top:10px; left:20px; font-size:12px; color:#444;">Daily Usage: <span id="u-tag">{{count}}</span>/50</div>
             <div id="box"></div>
             <div class="input-area">
-                <div id="img-preview" style="display:none; margin-bottom:10px;"><img id="pre-view" style="height:60px; border-radius:8px;"></div>
-                <div class="input-bar">
+                <div id="pre-box" style="display:none; margin-bottom:10px;"><img id="pre-img" style="height:50px; border-radius:5px;"></div>
+                <div class="bar">
                     <div class="plus-btn" onclick="togglePlus()">+
-                        <div class="plus-menu" id="plus-menu">
-                            <div onclick="document.getElementById('file-in').click()">🖼️ Upload Photo</div>
-                            <div onclick="toggleCanvas(true)">🎨 Open Canvas</div>
+                        <div class="plus-menu" id="p-menu">
+                            <div onclick="document.getElementById('f').click()">🖼️ Upload Photo</div>
+                            <div onclick="openCanvas()">🎨 Canvas</div>
                         </div>
                     </div>
-                    <input type="file" id="file-in" hidden onchange="handleFile(this)">
-                    <input type="text" id="msg-in" placeholder="Ask Nihit's AI..." onkeypress="if(event.key=='Enter')sendMsg()">
-                    <button id="send-btn" onclick="sendMsg()">Send</button>
-                    <button id="stop-btn" onclick="stopAI()">Stop</button>
+                    <input type="file" id="f" hidden onchange="pre(this)">
+                    <input type="text" id="in" placeholder="Ask Nihit's AI..." onkeypress="if(event.key=='Enter')send()">
+                    <button id="send-btn" onclick="send()">Send</button>
+                    <button id="stop-btn" onclick="stop()">Stop</button>
                 </div>
             </div>
         </div>
 
         <div id="canvas">
-            <div style="padding:10px; background:#111; display:flex; justify-content:space-between; align-items:center;">
-                <span style="font-size:13px; color:#888;">Code Canvas</span>
-                <div>
-                    <button onclick="runCode()" style="background:#22c55e; color:white; padding:4px 10px; font-size:12px;">Run</button>
-                    <button onclick="toggleCanvas(false)" style="background:transparent; color:red; font-size:18px;">✕</button>
-                </div>
+            <div style="padding:10px; background:#111; display:flex; justify-content:space-between;">
+                <span>Canvas</span>
+                <div><button onclick="run()">Run</button> <button onclick="openCanvas(false)">✕</button></div>
             </div>
-            <textarea id="code-editor" style="flex:1; background:#000; color:#4ade80; padding:15px; border:none; font-family:monospace; outline:none; resize:none;"></textarea>
-            <iframe id="output" style="height:45%; background:white; border:none;"></iframe>
+            <textarea id="code" style="flex:1; background:#000; color:#0f0; padding:15px; border:none; font-family:monospace; outline:none; resize:none;"></textarea>
+            <iframe id="out" style="height:45%; background:white; border:none;"></iframe>
         </div>
     </div>
 
-    <div id="settings" style="display:none; position:fixed; bottom:60px; left:20px; background:#222; padding:15px; border-radius:10px; border:1px solid #444; z-index:1000;">
-        <div onclick="clearChats()" style="color:#ff4d4d; cursor:pointer; font-weight:bold;">🗑️ Clear All History</div>
-        <div onclick="alert(document.cookie)" style="margin-top:12px; cursor:pointer; color:#aaa;">🍪 Cookie Preferences</div>
+    <div id="sett" style="display:none; position:fixed; bottom:60px; left:20px; background:#222; padding:15px; border-radius:10px; border:1px solid #444; z-index:1000;">
+        <div onclick="clearAll()" style="color:red; cursor:pointer;">🗑️ Clear All Chat</div>
+        <div onclick="alert(document.cookie)" style="margin-top:10px; cursor:pointer;">🍪 Cookies Pref</div>
     </div>
 
     <script>
-        let currentCid = null, selectedImg = null, aborter = null;
+        let cid = null, img = null, controller = null;
 
-        async function sendMsg() {
-            const input = document.getElementById("msg-in");
-            if(!input.value && !selectedImg) return;
-
-            const box = document.getElementById("box");
-            box.innerHTML += `<div class="msg user">${input.value}</div>`;
-            const val = input.value; input.value = "";
-            box.scrollTop = box.scrollHeight;
+        async function send() {
+            const i = document.getElementById("in");
+            if(!i.value && !img) return;
+            const b = document.getElementById("box");
+            b.innerHTML += `<div class="msg user">${i.value}</div>`;
+            const val = i.value; i.value = "";
+            b.scrollTop = b.scrollHeight;
 
             document.getElementById("send-btn").style.display = "none";
             document.getElementById("stop-btn").style.display = "block";
 
-            aborter = new AbortController();
+            controller = new AbortController();
             const fd = new FormData();
-            fd.append("msg", val); fd.append("chat", currentCid);
-            if(selectedImg) fd.append("image", selectedImg);
+            fd.append("msg", val); fd.append("chat", cid);
+            if(img) fd.append("image", img);
 
             try {
-                const r = await fetch("/send", {method:"POST", body:fd, signal: aborter.signal});
+                const r = await fetch("/send", {method:"POST", body:fd, signal: controller.signal});
                 const d = await r.json();
-                currentCid = d.chat_id;
-                
+                cid = d.chat_id;
                 let reply = d.reply;
                 if(reply.includes("```html")) {
-                    const code = reply.match(/```html([\\s\\S]*?)```/)[1].trim();
-                    toggleCanvas(true);
-                    document.getElementById("code-editor").value = code;
+                    openCanvas(true);
+                    document.getElementById("code").value = reply.match(/```html([\\s\\S]*?)```/)[1].trim();
                     reply = reply.replace(/```html[\\s\\S]*?```/g, "*(Code sent to Canvas)*");
                 }
-
-                box.innerHTML += `<div class="msg assistant">${reply}</div>`;
-                document.getElementById("usage-tag").innerText = d.new_count || "{{count}}";
-            } catch(e) { if(e.name !== 'AbortError') box.innerHTML += `<div class="msg assistant">Connection Lost.</div>`; }
+                b.innerHTML += `<div class="msg assistant">${reply}</div>`;
+                document.getElementById("u-tag").innerText = d.new_count || "{{count}}";
+            } catch(e) {}
 
             document.getElementById("send-btn").style.display = "block";
             document.getElementById("stop-btn").style.display = "none";
-            selectedImg = null; document.getElementById("img-preview").style.display = "none";
-            box.scrollTop = box.scrollHeight;
-            loadHistory();
+            img = null; document.getElementById("pre-box").style.display="none";
+            b.scrollTop = b.scrollHeight;
+            loadHist();
         }
 
-        function stopAI() { if(aborter) aborter.abort(); }
-        
-        function handleFile(input) {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                selectedImg = e.target.result.split(',')[1];
-                document.getElementById("pre-view").src = e.target.result;
-                document.getElementById("img-preview").style.display = "block";
+        function stop() { if(controller) controller.abort(); }
+        function pre(i) {
+            const r = new FileReader();
+            r.onload = (e) => {
+                img = e.target.result.split(',')[1];
+                document.getElementById("pre-img").src = e.target.result;
+                document.getElementById("pre-box").style.display = "block";
             };
-            reader.readAsDataURL(input.files[0]);
-            togglePlus();
+            r.readAsDataURL(i.files[0]); togglePlus();
         }
-
-        function toggleCanvas(show) {
-            document.getElementById("canvas").style.display = show ? "flex" : "none";
-            document.getElementById("chat-window").style.flex = show ? "0.5" : "1";
-        }
-        function runCode() {
-            const frame = document.getElementById("output").contentWindow.document;
-            frame.open(); frame.write(document.getElementById("code-editor").value); frame.close();
-        }
-        function togglePlus() { const m = document.getElementById("plus-menu"); m.style.display = m.style.display === "flex" ? "none" : "flex"; }
-        function toggleSettings() { const s = document.getElementById("settings"); s.style.display = s.style.display === "block" ? "none" : "block"; }
-        function filterChats() {
-            const q = document.getElementById("search").value.toLowerCase();
-            document.querySelectorAll(".h-item").forEach(i => i.style.display = i.innerText.toLowerCase().includes(q) ? "block" : "none");
-        }
-        function loadHistory() {
-            fetch("/get_history").then(r=>r.json()).then(data => {
-                const h = document.getElementById("history"); h.innerHTML = "";
-                data.forEach(c => h.innerHTML += `<div class="h-item" style="padding:10px; cursor:pointer; border-bottom:1px solid #222;">${c[1]}</div>`);
-            });
-        }
-        function clearChats() { if(confirm("Saari chats uda doon?")) fetch("/clear", {method:"POST"}).then(()=>location.reload()); }
-        loadHistory();
+        function openCanvas(s=true) { document.getElementById("canvas").style.display = s?"flex":"none"; document.getElementById("chat-pane").style.flex = s?"0.5":"1"; }
+        function run() { const f = document.getElementById("out").contentWindow.document; f.open(); f.write(document.getElementById("code").value); f.close(); }
+        function togglePlus() { const m = document.getElementById("p-menu"); m.style.display = m.style.display==="flex"?"none":"flex"; }
+        function toggleSett() { const s = document.getElementById("sett"); s.style.display = s.style.display==="block"?"none":"block"; }
+        function filter() { const q = document.getElementById("srch").value.toLowerCase(); document.querySelectorAll(".h-i").forEach(i => i.style.display = i.innerText.toLowerCase().includes(q)?"block":"none"); }
+        function loadHist() { fetch("/history").then(r=>r.json()).then(data => { const h = document.getElementById("hist"); h.innerHTML = ""; data.forEach(c => h.innerHTML += `<div class="h-i" style="padding:10px; cursor:pointer; border-bottom:1px solid #222;">${c[1]}</div>`); }); }
+        function clearAll() { if(confirm("Clear history?")) fetch("/clear", {method:"POST"}).then(()=>location.reload()); }
+        loadHist();
     </script>
 </body>
 </html>
@@ -278,3 +255,4 @@ UI_HTML = """
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+```[cite: 1]
